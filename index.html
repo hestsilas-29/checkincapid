@@ -129,8 +129,8 @@
       if (res.duplicate) {
         show('warn', 'Already checked in', 'CAPID ' + res.capid + ' at ' + String(res.time).slice(0, 5));
       } else {
-        show('ok', 'Checked in!', 'CAPID ' + res.capid + (res.name ? ' · ' + res.name : ''));
-        celebrate('Checked in!', res.name ? res.name : 'CAPID ' + res.capid);
+        show('ok', 'Checked in!', 'CAPID ' + res.capid);
+        celebrate('Checked in!', 'CAPID ' + res.capid);
       }
     } catch (e) {
       const q = getQueue(); q.push(payload); setQueue(q);
