@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Camera Check-In</title>
+<link rel="stylesheet" href="../app.css">
+<style>
+  body { overflow-x:hidden; }
+  .camera-card { padding:0; overflow:hidden; }
+  .camera-stage { position:relative; aspect-ratio:4/3; background:#02070d; }
+  #video { display:block; width:100%; height:100%; object-fit:cover; }
+  .camera-shade { position:absolute; inset:0; pointer-events:none; background:linear-gradient(to bottom, rgba(0,0,0,.28), transparent 25%, transparent 72%, rgba(0,0,0,.42)); }
+  .scan-frame { position:absolute; left:10%; right:10%; top:25%; height:50%; border:2px solid rgba(255,255,255,.85); border-radius:20px; box-shadow:0 0 0 999px rgba(0,0,0,.20); }
+  .scan-line { position:absolute; left:7%; right:7%; top:50%; height:2px; background:#7bd49a; box-shadow:0 0 14px #7bd49a; animation:scanline 2.2s ease-in-out infinite; }
+  .camera-hint { position:absolute; bottom:16px; left:0; right:0; text-align:center; color:white; font-size:.9rem; text-shadow:0 1px 7px rgba(0,0,0,.8); }
+  .camera-controls { display:grid; grid-template-columns:1fr 1fr; gap:10px; padding:14px; }
+  #cameraMsg { padding:0 14px 14px; color:var(--muted); text-align:center; }
+  #cameraMsg.bad { color:#ffc1ba; }
+  #cameraMsg.ok { color:#aaf1c1; }
+  @keyframes scanline { 0%,100% { transform:translateY(-58px); opacity:.3; } 50% { transform:translateY(58px); opacity:1; } }
+  @media (prefers-reduced-motion: reduce) { .scan-line { animation:none; } }
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">CAP</div>
+      <div>
+        <div class="brand-title">Camera Check-In</div>
+        <div class="brand-sub">Use your phone camera as the scanner</div>
+      </div>
+    </div>
+    <div class="top-actions"><a class="link-btn" href="../">⌨ Barcode reader</a></div>
+  </header>
+
+  <section id="setup" class="card">
+    <h2>Station code required</h2>
+    <p>Enter the station code from the configuration page. It is kept in memory only.</p>
+    <div class="setup-row">
+      <input id="keyInput" type="password" placeholder="Station code" autocomplete="off">
+      <button id="keySave" class="primary-btn" type="button">Unlock station</button>
+    </div>
+  </section>
+
+  <section class="card camera-card">
+    <div class="camera-stage">
+      <video id="video" playsinline muted></video>
+      <div class="camera-shade"></div>
+      <div class="scan-frame"><div class="scan-line"></div></div>
+      <div class="camera-hint">Center the membership-card barcode inside the box</div>
+    </div>
+    <div class="camera-controls">
+      <button id="start" class="primary-btn" type="button">Start camera</button>
+      <button id="stop" class="ghost-btn" type="button">Stop camera</button>
+    </div>
+    <div id="cameraMsg">Camera scanner is stopped.</div>
+    <div id="status" aria-live="polite">
+      <div id="title">Ready</div>
+      <div id="detail">Enter the station code to begin</div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span id="pending"></span>
+    <button id="changeKey" type="button">Change station code</button>
+  </footer>
+</main>
+
+<div id="burst" aria-live="polite"></div>
+<script src="../config.js"></script>
+<script>
+(async function () {
+  const $ = id => document.getElementById(id);
+  const LS = { queue: 'cap_queue' };
+  let stationKey = '';
+  let stream = null;
+  let detector = null;
+  let running = false;
+  let detecting = false;
+  let last = { id: '', t: 0 };
+  let burstTimer = null;
+  let clearTimer = null;
+
+  function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function getQueue() { try { return JSON.parse(lsGet(LS.queue, '[]')); } catch (e) { return []; } }
+  function setQueue(q) { lsSet(LS.queue, JSON.stringify(q)); renderPending(); }
+  function renderPending() { const n = getQueue().length; $('pending').textContent = n ? n + ' scan(s) waiting to upload · ' : ''; }
+  function needKey() { $('setup').style.display = 'block'; $('keyInput').focus(); }
+
+  function show(kind, title, detail) {
+    const s = $('status'); s.className = kind; $('title').textContent = title; $('detail').textContent = detail || '';
+    clearTimeout(clearTimer); if (kind !== 'wait') clearTimer = setTimeout(() => show('', 'Ready', 'Waiting for a barcode'), 5000);
+  }
+  function hideBurst() { clearTimeout(burstTimer); $('burst').classList.remove('show'); }
+  function celebrate(title, sub) {
+    const b = $('burst');
+    b.innerHTML = '<div class="badge"><span class="ring"></span><span class="ring r2"></span><span class="ring r3"></span>' +
+      '<svg viewBox="0 0 200 200" aria-hidden="true"><circle class="disc" cx="100" cy="100" r="92"/>' +
+      '<path class="tick" d="M62 104 L88 130 L140 74"/></svg></div><div id="bName"></div><div id="bSub"></div>';
+    $('bName').textContent = title; $('bSub').textContent = sub || '';
+    b.classList.remove('show'); void b.offsetWidth; b.classList.add('show');
+    clearTimeout(burstTimer); burstTimer = setTimeout(hideBurst, 2300);
+  }
+  $('burst').addEventListener('click', hideBurst);
+
+  async function post(body) {
+    const r = await fetch(API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify(body) });
+    return r.json();
+  }
+
+  async function handleScan(raw) {
+    const capid = String(raw || '').replace(/\D/g, '');
+    if (!capid) return;
+    if (capid.length < 4 || capid.length > 8) { show('bad', 'Could not read barcode', 'Try centering it in the box'); return; }
+    const now = Date.now();
+    if (capid === last.id && now - last.t < 3000) return;
+    last = { id:capid, t:now };
+    if (!API_URL || API_URL.indexOf('PASTE') === 0) { show('bad', 'Not configured', 'Set API_URL in config.js'); return; }
+    if (!stationKey) { needKey(); return; }
+
+    hideBurst(); show('wait', 'Checking…', 'CAPID ' + capid);
+    const payload = { action:'checkin', capid, ts:new Date(now).toISOString() };
+    try {
+      const res = await post(Object.assign({key:stationKey}, payload));
+      if (res.badKey) { stationKey=''; show('bad','Wrong station code','Please enter it again'); needKey(); return; }
+      if (!res.ok) { show('bad','Error',res.error || 'Try again'); return; }
+      if (res.duplicate) show('warn','Already checked in','CAPID ' + res.capid + ' at ' + String(res.time).slice(0,5));
+      else { show('ok','Checked in!','CAPID ' + res.capid + (res.name ? ' · ' + res.name : '')); celebrate('Checked in!', res.name || 'CAPID ' + res.capid); }
+    } catch (e) {
+      const q=getQueue(); q.push(payload); setQueue(q); show('warn','Saved offline','CAPID ' + capid + ' will upload when the connection returns');
+    }
+  }
+
+  async function flush() {
+    let q=getQueue(); if (!q.length || !stationKey) return;
+    while (q.length) {
+      try { const res=await post(Object.assign({}, q[0], {key:stationKey})); if (res.badKey) break; q.shift(); setQueue(q); }
+      catch (e) { break; }
+    }
+  }
+
+  async function startCamera() {
+    if (!stationKey) { needKey(); return; }
+    if (!window.isSecureContext) { cameraMsg('Camera access needs HTTPS. Open the GitHub Pages HTTPS address.','bad'); return; }
+    if (!('mediaDevices' in navigator) || !navigator.mediaDevices.getUserMedia) { cameraMsg('This browser does not provide camera access.','bad'); return; }
+    if (!('BarcodeDetector' in window)) { cameraMsg('This browser does not support built-in barcode scanning. Use the barcode-reader page or a newer Android/Chrome browser.','bad'); return; }
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      detector = new BarcodeDetector({ formats: supported.length ? supported : undefined });
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal:'environment' }, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+      $('video').srcObject = stream;
+      await $('video').play();
+      running = true;
+      cameraMsg('Camera is running. Center the barcode in the box.','ok');
+      detectLoop();
+    } catch (e) {
+      cameraMsg(e && e.name === 'NotAllowedError' ? 'Camera permission was denied. Allow camera access for this site and try again.' : 'Could not start the camera: ' + (e.message || e.name || 'unknown error'), 'bad');
+    }
+  }
+
+  function cameraMsg(text, kind) { $('cameraMsg').className = kind || ''; $('cameraMsg').textContent = text; }
+
+  async function detectLoop() {
+    if (!running || detecting) return;
+    detecting = true;
+    try {
+      if ($('video').readyState >= 2) {
+        const codes = await detector.detect($('video'));
+        if (codes && codes.length) {
+          const value = codes[0].rawValue || '';
+          if (value) await handleScan(value);
+        }
+      }
+    } catch (e) {
+      // Camera frames can fail briefly while autofocus adjusts; keep scanning.
+    } finally {
+      detecting = false;
+      if (running) setTimeout(detectLoop, 180);
+    }
+  }
+
+  function stopCamera() {
+    running = false;
+    detecting = false;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    $('video').srcObject = null;
+    cameraMsg('Camera scanner is stopped.');
+  }
+
+  $('keySave').addEventListener('click', () => {
+    const v=$('keyInput').value.trim(); if (!v) return;
+    stationKey=v; $('keyInput').value=''; $('setup').style.display='none';
+    show('', 'Ready', 'Press Start camera'); flush();
+  });
+  $('keyInput').addEventListener('keydown', e => { if (e.key==='Enter') $('keySave').click(); });
+  $('changeKey').addEventListener('click', () => { stopCamera(); needKey(); });
+  $('start').addEventListener('click', startCamera);
+  $('stop').addEventListener('click', stopCamera);
+  window.addEventListener('online', flush);
+  window.addEventListener('pagehide', stopCamera);
+  setInterval(flush, 30000);
+  renderPending();
+  needKey();
+})();
+</script>
+</body>
+</html>
