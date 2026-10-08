@@ -12,16 +12,18 @@
   .camera-stage { position:relative; aspect-ratio:4/3; background:#02070d; }
   #video { display:block; width:100%; height:100%; object-fit:cover; }
   .camera-shade { position:absolute; inset:0; pointer-events:none; background:linear-gradient(to bottom, rgba(0,0,0,.28), transparent 25%, transparent 72%, rgba(0,0,0,.42)); }
-  .scan-frame { position:absolute; left:10%; right:10%; top:25%; height:50%; border:2px solid rgba(255,255,255,.85); border-radius:20px; box-shadow:0 0 0 999px rgba(0,0,0,.20); }
-  .scan-line { position:absolute; left:7%; right:7%; top:50%; height:2px; background:#7bd49a; box-shadow:0 0 14px #7bd49a; animation:scanline 2.2s ease-in-out infinite; }
-  .camera-hint { position:absolute; bottom:16px; left:0; right:0; text-align:center; color:white; font-size:.9rem; text-shadow:0 1px 7px rgba(0,0,0,.8); }
+  .scan-frame { position:absolute; left:8%; right:8%; top:25%; height:50%; border:2px solid rgba(255,255,255,.85); border-radius:20px; box-shadow:0 0 0 999px rgba(0,0,0,.20); }
+  .scan-line { position:absolute; left:5%; right:5%; top:50%; height:2px; background:#7bd49a; box-shadow:0 0 14px #7bd49a; animation:scanline 2.2s ease-in-out infinite; }
+  .camera-hint { position:absolute; bottom:16px; left:0; right:0; text-align:center; color:white; font-size:.9rem; text-shadow:0 1px 7px rgba(0,0,0,.8); padding:0 18px; }
   .camera-controls { display:grid; grid-template-columns:1fr 1fr; gap:10px; padding:14px; }
-  #cameraMsg { padding:0 14px 14px; color:var(--muted); text-align:center; }
+  #cameraMsg { padding:0 14px 14px; color:var(--muted); text-align:center; min-height:22px; }
   #cameraMsg.bad { color:#ffc1ba; }
   #cameraMsg.ok { color:#aaf1c1; }
   @keyframes scanline { 0%,100% { transform:translateY(-58px); opacity:.3; } 50% { transform:translateY(58px); opacity:1; } }
   @media (prefers-reduced-motion: reduce) { .scan-line { animation:none; } }
 </style>
+<!-- BarcodeDetector is not used here. ZXing provides the camera decoder across a much wider range of browsers. -->
+<script src="https://unpkg.com/@zxing/browser@0.2.1" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/@zxing/browser@0.2.1';"></script>
 </head>
 <body>
 <main class="page">
@@ -47,19 +49,19 @@
 
   <section class="card camera-card">
     <div class="camera-stage">
-      <video id="video" playsinline muted></video>
+      <video id="video" playsinline autoplay muted></video>
       <div class="camera-shade"></div>
       <div class="scan-frame"><div class="scan-line"></div></div>
-      <div class="camera-hint">Center the membership-card barcode inside the box</div>
+      <div class="camera-hint">Center the CAP barcode inside the box</div>
     </div>
     <div class="camera-controls">
       <button id="start" class="primary-btn" type="button">Start camera</button>
       <button id="stop" class="ghost-btn" type="button">Stop camera</button>
     </div>
-    <div id="cameraMsg">Camera scanner is stopped.</div>
+    <div id="cameraMsg">Enter the station code, then tap Start camera.</div>
     <div id="status" aria-live="polite">
       <div id="title">Ready</div>
-      <div id="detail">Enter the station code to begin</div>
+      <div id="detail">Waiting for a barcode</div>
     </div>
   </section>
 
@@ -76,10 +78,8 @@
   const $ = id => document.getElementById(id);
   const LS = { queue: 'cap_queue' };
   let stationKey = '';
-  let stream = null;
-  let detector = null;
+  let controls = null;
   let running = false;
-  let detecting = false;
   let last = { id: '', t: 0 };
   let burstTimer = null;
   let clearTimer = null;
@@ -92,9 +92,14 @@
   function needKey() { $('setup').style.display = 'block'; $('keyInput').focus(); }
 
   function show(kind, title, detail) {
-    const s = $('status'); s.className = kind; $('title').textContent = title; $('detail').textContent = detail || '';
-    clearTimeout(clearTimer); if (kind !== 'wait') clearTimer = setTimeout(() => show('', 'Ready', 'Waiting for a barcode'), 5000);
+    const s = $('status');
+    s.className = kind;
+    $('title').textContent = title;
+    $('detail').textContent = detail || '';
+    clearTimeout(clearTimer);
+    if (kind !== 'wait') clearTimer = setTimeout(() => show('', 'Ready', 'Waiting for a barcode'), 5000);
   }
+
   function hideBurst() { clearTimeout(burstTimer); $('burst').classList.remove('show'); }
   function celebrate(title, sub) {
     const b = $('burst');
@@ -103,12 +108,13 @@
       '<path class="tick" d="M62 104 L88 130 L140 74"/></svg></div><div id="bName"></div><div id="bSub"></div>';
     $('bName').textContent = title; $('bSub').textContent = sub || '';
     b.classList.remove('show'); void b.offsetWidth; b.classList.add('show');
-    clearTimeout(burstTimer); burstTimer = setTimeout(hideBurst, 2300);
+    clearTimeout(burstTimer); burstTimer = setTimeout(hideBurst, 1800);
   }
   $('burst').addEventListener('click', hideBurst);
 
   async function post(body) {
     const r = await fetch(API_URL, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify(body) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
 
@@ -128,8 +134,12 @@
       const res = await post(Object.assign({key:stationKey}, payload));
       if (res.badKey) { stationKey=''; show('bad','Wrong station code','Please enter it again'); needKey(); return; }
       if (!res.ok) { show('bad','Error',res.error || 'Try again'); return; }
-      if (res.duplicate) show('warn','Already checked in','CAPID ' + res.capid + ' at ' + String(res.time).slice(0,5));
-      else { show('ok','Checked in!','CAPID ' + res.capid + (res.name ? ' · ' + res.name : '')); celebrate('Checked in!', res.name || 'CAPID ' + res.capid); }
+      if (res.duplicate) {
+        show('warn','Already checked in','CAPID ' + res.capid + ' at ' + String(res.time).slice(0,5));
+      } else {
+        show('ok','Checked in!','CAPID ' + res.capid);
+        celebrate('Checked in!', 'CAPID ' + res.capid);
+      }
     } catch (e) {
       const q=getQueue(); q.push(payload); setQueue(q); show('warn','Saved offline','CAPID ' + capid + ' will upload when the connection returns');
     }
@@ -145,50 +155,61 @@
 
   async function startCamera() {
     if (!stationKey) { needKey(); return; }
-    if (!window.isSecureContext) { cameraMsg('Camera access needs HTTPS. Open the GitHub Pages HTTPS address.','bad'); return; }
-    if (!('mediaDevices' in navigator) || !navigator.mediaDevices.getUserMedia) { cameraMsg('This browser does not provide camera access.','bad'); return; }
-    if (!('BarcodeDetector' in window)) { cameraMsg('This browser does not support built-in barcode scanning. Use the barcode-reader page or a newer Android/Chrome browser.','bad'); return; }
+    if (!window.isSecureContext) { cameraMsg('Camera access requires HTTPS. Cloudflare Pages should serve this site over HTTPS.','bad'); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { cameraMsg('This browser does not provide camera access. Try the latest Chrome, Edge, or Safari on the device.','bad'); return; }
+    if (!window.ZXingBrowser || !window.ZXingBrowser.BrowserMultiFormatReader) {
+      cameraMsg('The barcode decoder did not load. Check the internet connection and refresh this page.','bad');
+      return;
+    }
+    if (running) return;
+
+    stopCamera();
+    cameraMsg('Requesting camera access…');
     try {
-      const supported = await BarcodeDetector.getSupportedFormats();
-      detector = new BarcodeDetector({ formats: supported.length ? supported : undefined });
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal:'environment' }, width:{ideal:1280}, height:{ideal:720} }, audio:false });
-      $('video').srcObject = stream;
-      await $('video').play();
+      const reader = new ZXingBrowser.BrowserMultiFormatReader();
+      const video = $('video');
+      controls = await reader.decodeFromConstraints(
+        {
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        },
+        video,
+        async (result, error) => {
+          if (result) {
+            const text = typeof result.getText === 'function' ? result.getText() : result.text;
+            if (text) await handleScan(text);
+          }
+        }
+      );
       running = true;
       cameraMsg('Camera is running. Center the barcode in the box.','ok');
-      detectLoop();
     } catch (e) {
-      cameraMsg(e && e.name === 'NotAllowedError' ? 'Camera permission was denied. Allow camera access for this site and try again.' : 'Could not start the camera: ' + (e.message || e.name || 'unknown error'), 'bad');
+      running = false;
+      const name = e && e.name ? e.name : '';
+      let msg = 'Could not start the camera.';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') msg = 'Camera permission was denied. Allow camera access for this site and try again.';
+      else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') msg = 'No camera was found on this device.';
+      else if (name === 'NotReadableError' || name === 'TrackStartError') msg = 'The camera is already being used by another app or browser tab.';
+      else if (e && e.message) msg += ' ' + e.message;
+      cameraMsg(msg,'bad');
     }
   }
 
   function cameraMsg(text, kind) { $('cameraMsg').className = kind || ''; $('cameraMsg').textContent = text; }
 
-  async function detectLoop() {
-    if (!running || detecting) return;
-    detecting = true;
-    try {
-      if ($('video').readyState >= 2) {
-        const codes = await detector.detect($('video'));
-        if (codes && codes.length) {
-          const value = codes[0].rawValue || '';
-          if (value) await handleScan(value);
-        }
-      }
-    } catch (e) {
-      // Camera frames can fail briefly while autofocus adjusts; keep scanning.
-    } finally {
-      detecting = false;
-      if (running) setTimeout(detectLoop, 180);
-    }
-  }
-
   function stopCamera() {
     running = false;
-    detecting = false;
-    if (stream) stream.getTracks().forEach(t => t.stop());
-    stream = null;
-    $('video').srcObject = null;
+    if (controls && typeof controls.stop === 'function') {
+      try { controls.stop(); } catch (e) {}
+    }
+    controls = null;
+    const video = $('video');
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
     cameraMsg('Camera scanner is stopped.');
   }
 
