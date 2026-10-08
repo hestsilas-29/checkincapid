@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>CAP Cadet Check-In</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main class="page">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">CAP</div>
+      <div>
+        <div class="brand-title">Cadet Check-In</div>
+        <div class="brand-sub">Attendance station</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <a class="link-btn" href="camera/">📷 Camera</a>
+      <a class="link-btn" href="config.html">⚙ Config</a>
+    </div>
+  </header>
+
+  <section class="hero">
+    <h1>Ready to scan</h1>
+    <p>Scan a CAP membership card with the connected barcode reader. The check-in is recorded automatically.</p>
+  </section>
+
+  <section id="setup" class="card">
+    <h2>Station code required</h2>
+    <p>Enter the station code from the configuration page. It stays in memory and is cleared when this page is refreshed.</p>
+    <div class="setup-row">
+      <input id="keyInput" type="password" placeholder="Station code" autocomplete="off">
+      <button id="keySave" class="primary-btn" type="button">Unlock station</button>
+    </div>
+  </section>
+
+  <section class="card scanner-card">
+    <div class="scan-wrap">
+      <input id="scan" type="text" inputmode="none" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Waiting for scan…" autofocus aria-label="CAPID scanner input">
+    </div>
+    <div class="scanner-actions">
+      <a class="primary-btn" href="camera/">Use camera instead</a>
+      <button id="clearStatus" class="ghost-btn" type="button">Clear status</button>
+    </div>
+    <div id="status" aria-live="polite">
+      <div id="title"><span class="status-dot"></span>Ready</div>
+      <div id="detail">Waiting for a CAP membership card</div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span id="pending"></span>
+    <button id="changeKey" type="button">Change station code</button>
+  </footer>
+</main>
+
+<div id="burst" aria-live="polite"></div>
+<script src="config.js"></script>
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const LS = { queue: 'cap_queue' };
+  let stationKey = '';
+  const scan = $('scan');
+  let last = { id: '', t: 0 };
+  let clearTimer = null;
+  let burstTimer = null;
+
+  function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function getQueue() { try { return JSON.parse(lsGet(LS.queue, '[]')); } catch (e) { return []; } }
+  function setQueue(q) { lsSet(LS.queue, JSON.stringify(q)); renderPending(); }
+  function renderPending() { const n = getQueue().length; $('pending').textContent = n ? n + ' scan(s) waiting to upload · ' : ''; }
+
+  function show(kind, title, detail) {
+    const s = $('status');
+    s.className = kind;
+    $('title').textContent = title;
+    $('detail').textContent = detail || '';
+    clearTimeout(clearTimer);
+    if (kind !== 'wait') clearTimer = setTimeout(() => show('', 'Ready', 'Waiting for a CAP membership card'), 5000);
+  }
+
+  function hideBurst() { clearTimeout(burstTimer); $('burst').classList.remove('show'); }
+  function celebrate(title, sub) {
+    const b = $('burst');
+    b.innerHTML =
+      '<div class="badge"><span class="ring"></span><span class="ring r2"></span><span class="ring r3"></span>' +
+      '<svg viewBox="0 0 200 200" aria-hidden="true"><circle class="disc" cx="100" cy="100" r="92"/>' +
+      '<path class="tick" d="M62 104 L88 130 L140 74"/></svg></div>' +
+      '<div id="bName"></div><div id="bSub"></div>';
+    $('bName').textContent = title;
+    $('bSub').textContent = sub || '';
+    b.classList.remove('show'); void b.offsetWidth; b.classList.add('show');
+    clearTimeout(burstTimer); burstTimer = setTimeout(hideBurst, 2300);
+  }
+  $('burst').addEventListener('click', hideBurst);
+
+  function needKey() { $('setup').style.display = 'block'; $('keyInput').focus(); }
+  function focusScan() { if ($('setup').style.display !== 'block') scan.focus(); }
+
+  async function post(body) {
+    const r = await fetch(API_URL, {
+      method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body)
+    });
+    return r.json();
+  }
+
+  async function handleScan(raw) {
+    const capid = String(raw || '').replace(/\D/g, '');
+    if (!capid) return;
+    if (capid.length < 4 || capid.length > 8) { show('bad', 'Could not read card', 'Please scan again'); return; }
+    const now = Date.now();
+    if (capid === last.id && now - last.t < 3000) return;
+    last = { id: capid, t: now };
+
+    if (!API_URL || API_URL.indexOf('PASTE') === 0) { show('bad', 'Not configured', 'Set API_URL in config.js'); return; }
+    if (!stationKey) { needKey(); return; }
+
+    hideBurst(); show('wait', 'Checking…', 'CAPID ' + capid);
+    const payload = { action: 'checkin', capid, ts: new Date(now).toISOString() };
+    try {
+      const res = await post(Object.assign({ key: stationKey }, payload));
+      if (res.badKey) { stationKey = ''; show('bad', 'Wrong station code', 'Please enter it again'); needKey(); return; }
+      if (!res.ok) { show('bad', 'Error', res.error || 'Try again'); return; }
+      if (res.duplicate) {
+        show('warn', 'Already checked in', 'CAPID ' + res.capid + ' at ' + String(res.time).slice(0, 5));
+      } else {
+        show('ok', 'Checked in!', 'CAPID ' + res.capid + (res.name ? ' · ' + res.name : ''));
+        celebrate('Checked in!', res.name ? res.name : 'CAPID ' + res.capid);
+      }
+    } catch (e) {
+      const q = getQueue(); q.push(payload); setQueue(q);
+      show('warn', 'Saved offline', 'CAPID ' + capid + ' will upload when the connection returns');
+    }
+  }
+
+  async function flush() {
+    let q = getQueue();
+    if (!q.length || !stationKey) return;
+    while (q.length) {
+      try {
+        const res = await post(Object.assign({}, q[0], { key: stationKey }));
+        if (res.badKey) break;
+        q.shift(); setQueue(q);
+      } catch (e) { break; }
+    }
+  }
+
+  scan.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); const v = scan.value; scan.value = ''; handleScan(v); }
+  });
+  scan.addEventListener('input', () => {
+    const digits = scan.value.replace(/\D/g, '');
+    if (digits.length >= 6) { scan.value = ''; handleScan(digits); }
+  });
+  scan.addEventListener('blur', () => setTimeout(focusScan, 120));
+  document.addEventListener('click', e => {
+    if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON' && e.target.tagName !== 'A') focusScan();
+  });
+
+  $('keySave').addEventListener('click', () => {
+    const v = $('keyInput').value.trim();
+    if (!v) return;
+    stationKey = v; $('keyInput').value = '';
+    $('setup').style.display = 'none'; show('', 'Ready', 'Waiting for a CAP membership card'); scan.focus(); flush();
+  });
+  $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('keySave').click(); });
+  $('changeKey').addEventListener('click', needKey);
+  $('clearStatus').addEventListener('click', () => show('', 'Ready', 'Waiting for a CAP membership card'));
+
+  window.addEventListener('online', flush);
+  setInterval(flush, 30000);
+  renderPending();
+  needKey();
+})();
+</script>
+</body>
+</html>
